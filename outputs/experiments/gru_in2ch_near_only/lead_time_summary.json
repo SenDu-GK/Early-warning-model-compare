@@ -1,0 +1,14 @@
+{
+  "tau": 0.8467119932174683,
+  "far_target": 0.01,
+  "far_actual": 0.009958382877526754,
+  "calib_end_k": 26,
+  "calib_end_epoch": "D20171227",
+  "detect_k": 28,
+  "detect_epoch": "D20180120",
+  "detect_date": "2018-01-20",
+  "event_date": "2018-03-09",
+  "lead_time_days": 48.0,
+  "consecutive_m": 3,
+  "tpr_near_event": 0.8385542168674699
+}

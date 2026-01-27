@@ -1,0 +1,2 @@
+tau,far_target,far_actual,calib_end_k,calib_end_epoch,detect_k,detect_epoch,detect_date,event_date,lead_time_days,consecutive_m
+0.927047073841095,0.01,0.01003269916765755,26,D20171227,29,D20180201,2018-02-01,2018-03-09,36.0,3
