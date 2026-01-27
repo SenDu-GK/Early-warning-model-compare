@@ -4,3 +4,6 @@ scikit-learn
 pyyaml
 tqdm
 torch
+geopandas
+matplotlib
+scipy

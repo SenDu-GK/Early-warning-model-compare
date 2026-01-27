@@ -1,0 +1,5 @@
+Trend window: last 10 epochs
+core_mean_risk Spearman r=0.9394, p=0.0001
+AUC core vs far Spearman r=0.6121, p=0.0600
+AUC core vs near Spearman r=0.7333, p=0.0158
+AUC core vs all Spearman r=0.7333, p=0.0158
