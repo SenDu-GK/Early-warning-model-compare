@@ -53,9 +53,10 @@ def select_best(df: pd.DataFrame) -> pd.Series | None:
     return eligible.iloc[0]
 
 
-def shared_split_path(seed: int) -> Path:
+def shared_split_path(seed: int, case_names: list[str]) -> Path:
     SPLITS_DIR.mkdir(parents=True, exist_ok=True)
-    return SPLITS_DIR / f"split_seed{seed}.json"
+    name_tag = "-".join(case_names)
+    return SPLITS_DIR / f"split_seed{seed}_cases_{name_tag}.json"
 
 
 def main() -> None:
@@ -64,7 +65,8 @@ def main() -> None:
     # Use the leadtime base config as the source of truth for the shared split seed.
     lead_cfg = load_config(TASK_BASE_CONFIGS["leadtime_cls"])
     split_seed = int(lead_cfg["SPLIT"]["SEED"])
-    split_path = shared_split_path(split_seed)
+    case_names = [c.get("name", "case") for c in lead_cfg.get("DATA", {}).get("CASES", [])]
+    split_path = shared_split_path(split_seed, case_names)
     print(f"Shared split file: {split_path}")
 
     models = ["tcn", "gru"]

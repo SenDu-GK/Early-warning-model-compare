@@ -1,0 +1,14 @@
+{
+  "tau": 0.9806271195411682,
+  "far_target": 0.01,
+  "far_actual": 0.009914529914529915,
+  "calib_end_k": 28,
+  "calib_end_epoch": "D20241220",
+  "detect_k": null,
+  "detect_epoch": "",
+  "detect_date": "",
+  "event_date": "2025-02-18",
+  "lead_time_days": NaN,
+  "consecutive_m": 3,
+  "tpr_near_event": 0.12103004291845494
+}

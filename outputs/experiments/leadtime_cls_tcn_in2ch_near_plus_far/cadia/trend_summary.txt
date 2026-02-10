@@ -1,0 +1,3 @@
+Trend p-values (Spearman approximation):
+- core_mean_risk_p: 3.683142679733464e-11
+- auc_core_vs_near_p: 6.625949864336178e-07

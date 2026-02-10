@@ -63,6 +63,25 @@ def set_seeds(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def normalize_cases(cfg: dict) -> List[dict]:
+    data_cfg = cfg["DATA"]
+    if "CASES" in data_cfg:
+        cases = data_cfg["CASES"]
+    else:
+        cases = [
+            {
+                "name": data_cfg.get("NAME", "case"),
+                "csv_path": data_cfg["CSV_PATH"],
+                "kml_path": data_cfg["KML_PATH"],
+                "event_date": data_cfg["EVENT_DATE"],
+                "last_obs_date": data_cfg.get("LAST_OBS_DATE"),
+            }
+        ]
+    if not cases:
+        raise ValueError("DATA.CASES is empty.")
+    return cases
+
+
 # -----------------------------------------------------------------------------
 # Data + geometry
 # -----------------------------------------------------------------------------
@@ -227,7 +246,6 @@ def build_feature_channels_batch(window_vals: np.ndarray, input_mode: str) -> np
     any_valid = mask.any(axis=1)
     first_idx = mask.argmax(axis=1)
 
-    # Gather first valid values; when none valid, baseline=0.
     gathered = np.take_along_axis(window_vals, first_idx[:, None], axis=1).squeeze(1)
     baseline = np.where(any_valid, gathered, 0.0).astype(np.float32)
 
@@ -444,6 +462,45 @@ def build_training_windows_leadtime(
     return X, y, point_to_idx_arr, meta
 
 
+def build_training_windows_leadtime_multi(
+    cases: List[dict],
+    window_length: int,
+    horizon_h: int,
+    input_mode: str,
+    neg_mode: str,
+) -> Tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    X_parts: list[np.ndarray] = []
+    y_parts: list[np.ndarray] = []
+    point_to_indices: dict[str, list[int]] = {}
+    offset = 0
+
+    for case in cases:
+        X, y, point_to_idx, _ = build_training_windows_leadtime(
+            values=case["values"],
+            ids=case["ids"],
+            label_texts=case["label_texts"],
+            epoch_cols=case["epoch_cols"],
+            epoch_dates=case["epoch_dates"],
+            t_last=case["t_last"],
+            window_length=window_length,
+            horizon_h=horizon_h,
+            input_mode=input_mode,
+            neg_mode=neg_mode,
+        )
+        X_parts.append(X)
+        y_parts.append(y)
+
+        for pid, idxs in point_to_idx.items():
+            point_to_indices.setdefault(pid, []).extend((idxs + offset).tolist())
+
+        offset += len(y)
+
+    X_all = np.concatenate(X_parts, axis=0)
+    y_all = np.concatenate(y_parts, axis=0)
+    point_to_indices_arr = {pid: np.asarray(idxs, dtype=np.int64) for pid, idxs in point_to_indices.items()}
+    return X_all, y_all, point_to_indices_arr
+
+
 def indices_for_points(point_ids: Sequence[str], point_to_indices: dict[str, np.ndarray]) -> np.ndarray:
     parts: list[np.ndarray] = []
     for pid in point_ids:
@@ -558,6 +615,17 @@ def evaluate_auc_binary(model: nn.Module, loader: DataLoader, device: torch.devi
     return float(roc_auc_score(y_true, y_score))
 
 
+def batched_predict_sigmoid(model: nn.Module, X: np.ndarray, device: torch.device, batch_size: int) -> np.ndarray:
+    model.eval()
+    out = np.empty(X.shape[0], dtype=np.float32)
+    with torch.no_grad():
+        for i in range(0, X.shape[0], batch_size):
+            xb = torch.from_numpy(X[i : i + batch_size]).to(device)
+            logits = model(xb)
+            out[i : i + batch_size] = torch.sigmoid(logits).detach().cpu().numpy()
+    return out
+
+
 def compute_risk_cube_leadtime(
     model: nn.Module,
     values: np.ndarray,
@@ -583,17 +651,23 @@ def compute_risk_cube_leadtime(
 
 
 class SurvivalPointDataset(Dataset):
-    def __init__(self, X_seq: np.ndarray, event_flag: np.ndarray, point_ids: np.ndarray) -> None:
-        # X_seq: [N, T, C, L]
+    def __init__(
+        self,
+        X_seq: np.ndarray,
+        mask_seq: np.ndarray,
+        event_flag: np.ndarray,
+        t_event_idx: np.ndarray,
+    ) -> None:
         self.X_seq = torch.from_numpy(X_seq)
+        self.mask_seq = torch.from_numpy(mask_seq.astype(np.float32))
         self.event_flag = torch.from_numpy(event_flag.astype(np.float32))
-        self.point_ids = point_ids
+        self.t_event_idx = torch.from_numpy(t_event_idx.astype(np.int64))
 
     def __len__(self) -> int:
         return int(self.X_seq.shape[0])
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.X_seq[idx], self.event_flag[idx]
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.X_seq[idx], self.mask_seq[idx], self.event_flag[idx], self.t_event_idx[idx]
 
 
 def precompute_seq_windows(values: np.ndarray, k_indices: Sequence[int], window_length: int, input_mode: str) -> np.ndarray:
@@ -606,23 +680,45 @@ def precompute_seq_windows(values: np.ndarray, k_indices: Sequence[int], window_
     return X_seq
 
 
-def survival_nll_loss(h: torch.Tensor, event_flag: torch.Tensor, pos_weight: float) -> torch.Tensor:
-    """Discrete-time survival NLL.
+def pad_sequences(seqs: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+    max_t = max(s.shape[1] for s in seqs)
+    n_total = sum(s.shape[0] for s in seqs)
+    c = seqs[0].shape[2]
+    l = seqs[0].shape[3]
 
-    h: [B, T] hazards in (0,1)
-    event_flag: [B] (1 for core event at last step, 0 for censored)
-    pos_weight: weighting multiplier for event points
-    """
+    X_pad = np.zeros((n_total, max_t, c, l), dtype=np.float32)
+    mask = np.zeros((n_total, max_t), dtype=np.float32)
+
+    offset = 0
+    for s in seqs:
+        n, t, _, _ = s.shape
+        X_pad[offset : offset + n, :t] = s
+        mask[offset : offset + n, :t] = 1.0
+        offset += n
+
+    return X_pad, mask
+
+
+def survival_nll_loss(h: torch.Tensor, mask: torch.Tensor, event_flag: torch.Tensor, t_event: torch.Tensor, pos_weight: float) -> torch.Tensor:
     eps = 1e-6
     h = h.clamp(min=eps, max=1.0 - eps)
     log_surv = torch.log1p(-h)
 
-    t_event = h.shape[1] - 1
-    surv_before = log_surv[:, :t_event].sum(dim=1)
-    log_h_event = torch.log(h[:, t_event])
+    B, T = h.shape
+    time_idx = torch.arange(T, device=h.device)[None, :]
+    t_event = t_event.unsqueeze(1)
+
+    mask_before = (time_idx < t_event).float() * mask
+    mask_upto = (time_idx <= t_event).float() * mask
+
+    surv_before = (log_surv * mask_before).sum(dim=1)
+    surv_upto = (log_surv * mask_upto).sum(dim=1)
+
+    h_event = h.gather(1, t_event.long()).squeeze(1)
+    log_h_event = torch.log(h_event)
 
     nll_event = -(surv_before + log_h_event)
-    nll_cens = -(log_surv.sum(dim=1))
+    nll_cens = -surv_upto
 
     weights = torch.where(event_flag > 0.5, torch.full_like(event_flag, float(pos_weight)), torch.ones_like(event_flag))
     losses = torch.where(event_flag > 0.5, nll_event, nll_cens) * weights
@@ -660,9 +756,11 @@ def train_model_survival(
     for epoch in range(1, max_epochs + 1):
         model.train()
         train_losses: list[float] = []
-        for xb_seq, event_b in train_loader:
+        for xb_seq, mask_b, event_b, t_event_b in train_loader:
             xb_seq = xb_seq.to(device)  # [B, T, C, L]
-            event_b = event_b.to(device)  # [B]
+            mask_b = mask_b.to(device)
+            event_b = event_b.to(device)
+            t_event_b = t_event_b.to(device)
 
             B, T, C, L = xb_seq.shape
             xb_flat = xb_seq.view(B * T, C, L)
@@ -670,7 +768,7 @@ def train_model_survival(
             optimizer.zero_grad(set_to_none=True)
             logits = model(xb_flat).view(B, T)
             h = torch.sigmoid(logits)
-            loss = survival_nll_loss(h, event_b, pos_weight=pos_weight)
+            loss = survival_nll_loss(h, mask_b, event_b, t_event_b, pos_weight=pos_weight)
             loss.backward()
             optimizer.step()
             train_losses.append(float(loss.item()))
@@ -678,14 +776,16 @@ def train_model_survival(
         model.eval()
         val_losses: list[float] = []
         with torch.no_grad():
-            for xb_seq, event_b in val_loader:
+            for xb_seq, mask_b, event_b, t_event_b in val_loader:
                 xb_seq = xb_seq.to(device)
+                mask_b = mask_b.to(device)
                 event_b = event_b.to(device)
+                t_event_b = t_event_b.to(device)
                 B, T, C, L = xb_seq.shape
                 xb_flat = xb_seq.view(B * T, C, L)
                 logits = model(xb_flat).view(B, T)
                 h = torch.sigmoid(logits)
-                val_losses.append(float(survival_nll_loss(h, event_b, pos_weight=pos_weight).item()))
+                val_losses.append(float(survival_nll_loss(h, mask_b, event_b, t_event_b, pos_weight=pos_weight).item()))
 
         train_loss = float(np.mean(train_losses)) if train_losses else float("nan")
         val_loss = float(np.mean(val_losses)) if val_losses else float("nan")
@@ -712,11 +812,6 @@ def compute_risk_cube_survival(
     device: torch.device,
     batch_size: int,
 ) -> np.ndarray:
-    """Compute hazards and cumulative risk R_k for all points/epochs.
-
-    X_seq: [N, T, C, L]
-    Returns risk_cube: [T, N]
-    """
     model.eval()
     N, T, C, L = X_seq.shape
     hazards = np.empty((N, T), dtype=np.float32)
@@ -754,11 +849,6 @@ class ForecastDataset(Dataset):
 
 
 def build_future_targets(values: np.ndarray, k: int, horizon_f: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Return future values and mask with padding to horizon_f.
-
-    values: [N, E]
-    Returns y_true, mask: [N, Hf]
-    """
     N, E = values.shape
     y = np.full((N, horizon_f), np.nan, dtype=np.float32)
     start = k + 1
@@ -789,7 +879,6 @@ def build_forecast_samples(
         yk = y_all[row_indices]
         mk = m_all[row_indices]
 
-        # Keep only samples with at least one observed future step.
         keep = mk.sum(axis=1) > 0
         if not np.any(keep):
             continue
@@ -877,17 +966,6 @@ def train_model_forecast(
     if best_path.exists():
         model.load_state_dict(torch.load(best_path, map_location=device))
     return best_path
-
-
-def batched_predict_sigmoid(model: nn.Module, X: np.ndarray, device: torch.device, batch_size: int) -> np.ndarray:
-    model.eval()
-    out = np.empty(X.shape[0], dtype=np.float32)
-    with torch.no_grad():
-        for i in range(0, X.shape[0], batch_size):
-            xb = torch.from_numpy(X[i : i + batch_size]).to(device)
-            logits = model(xb)
-            out[i : i + batch_size] = torch.sigmoid(logits).detach().cpu().numpy()
-    return out
 
 
 def batched_predict_forecast(model: nn.Module, X: np.ndarray, device: torch.device, batch_size: int) -> np.ndarray:
@@ -1060,7 +1138,6 @@ def compute_trend_pvalues(mean_df: pd.DataFrame, auc_df: pd.DataFrame) -> dict:
 def evaluate_and_save_outputs(
     risk_cube: np.ndarray,
     k_indices: Sequence[int],
-    values: np.ndarray,
     df_latlon: GeoDataFrame,
     df_utm: GeoDataFrame,
     polygon_latlon: Polygon,
@@ -1068,6 +1145,7 @@ def evaluate_and_save_outputs(
     epoch_cols: Sequence[str],
     epoch_dates: Sequence[pd.Timestamp],
     t_last: int,
+    event_date: str,
     cfg: dict,
     run_dir: Path,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
@@ -1094,7 +1172,6 @@ def evaluate_and_save_outputs(
     png_latlon_dir = run_dir / "risk_maps_png_latlon"
     png_utm_dir = run_dir / "risk_maps_png_utm"
 
-    # Risk maps.
     for j, k in enumerate(k_indices):
         risks = risk_cube[j]
         epoch_label = epoch_cols[k]
@@ -1155,7 +1232,6 @@ def evaluate_and_save_outputs(
         fig.savefig(png_utm_dir / f"risk_top_utm_{epoch_label}.png", dpi=dpi)
         plt.close(fig)
 
-    # Time-series metrics.
     bootstrap_n = int(stats_cfg["BOOTSTRAP_N"])
     perm_n = int(stats_cfg["PERM_N"])
     permute_near_only = bool(stats_cfg.get("PERMUTE_FROM_NEAR_EVENT_ONLY", True))
@@ -1246,7 +1322,6 @@ def evaluate_and_save_outputs(
     if not auc_far_df.empty:
         auc_far_df.to_csv(run_dir / "auc_over_time_core_vs_far.csv", index=False)
 
-    # Lead-time metric calibration.
     far_target = float(thresh_cfg["FAR_TARGET"])
     consecutive_m = int(thresh_cfg["CONSECUTIVE_M"])
     calib_offset = int(thresh_cfg["FAR_CALIB_END_OFFSET_FROM_LAST"])
@@ -1268,16 +1343,17 @@ def evaluate_and_save_outputs(
     core_means = mean_df["core_mean_risk"].to_numpy()
     detect_k = earliest_consecutive_exceedance(k_indices, core_means, tau, consecutive_m) if not np.isnan(tau) else None
 
-    event_date = pd.Timestamp(cfg["DATA"]["EVENT_DATE"])
+    event_date_ts = pd.Timestamp(event_date)
     if detect_k is None:
         detect_date = pd.NaT
         lead_days = float("nan")
     else:
         detect_date = epoch_dates[int(detect_k)]
-        lead_days = float((event_date - detect_date).days)
+        lead_days = float((event_date_ts - detect_date).days)
 
     near_rng_idx = list(near_event_range(t_last, horizon_h))
     near_rng_mask = np.isin(k_indices, near_rng_idx)
+    core_idx = np.where(label_texts == "core")[0]
     core_near = risk_cube[near_rng_mask][:, core_idx].ravel() if len(core_idx) else np.array([])
     core_near = core_near[~np.isnan(core_near)]
     tpr = float(np.mean(core_near > tau)) if (len(core_near) and not np.isnan(tau)) else float("nan")
@@ -1291,14 +1367,13 @@ def evaluate_and_save_outputs(
         "detect_k": None if detect_k is None else int(detect_k),
         "detect_epoch": "" if detect_k is None else epoch_cols[int(detect_k)],
         "detect_date": "" if detect_k is None else str(detect_date.date()),
-        "event_date": str(event_date.date()),
+        "event_date": str(event_date_ts.date()),
         "lead_time_days": lead_days,
         "consecutive_m": consecutive_m,
         "tpr_near_event": tpr,
     }
     (run_dir / "lead_time_summary.json").write_text(json.dumps(lead_summary, indent=2), encoding="utf-8")
 
-    # Plots.
     def _plot_with_ci(df: pd.DataFrame, y: str, lo: str, hi: str, title: str, out_path: Path, ylabel: str) -> None:
         if df.empty:
             return
@@ -1367,11 +1442,9 @@ def evaluate_and_save_outputs(
     return mean_df, auc_df, auc_far_df, {**lead_summary, **trend_p}
 
 
-def write_results_readme(cfg: dict, t_last: int, epoch_cols: Sequence[str], epoch_dates: Sequence[pd.Timestamp], run_dir: Path) -> None:
+def write_results_readme(cfg: dict, t_last: int, epoch_cols: Sequence[str], epoch_dates: Sequence[pd.Timestamp], run_dir: Path, event_date: str, last_obs: str) -> None:
     label_cfg = cfg["LABELING"]
     thresh_cfg = cfg["THRESHOLDING"]
-    event_date = cfg["DATA"]["EVENT_DATE"]
-    last_obs = cfg["DATA"]["LAST_OBS_DATE"]
     horizon_h = int(label_cfg["HORIZON_H"])
     near_start = max(0, t_last - horizon_h)
     task = str(cfg.get("TASK", "leadtime_cls"))
@@ -1428,7 +1501,8 @@ def write_results_readme(cfg: dict, t_last: int, epoch_cols: Sequence[str], epoc
 
 def default_split_path_for_cfg(cfg: dict) -> Path:
     seed = int(cfg["SPLIT"]["SEED"])
-    return DEFAULT_SPLITS_DIR / f"split_seed{seed}.json"
+    case_names = "-".join([c.get("name", "case") for c in normalize_cases(cfg)])
+    return DEFAULT_SPLITS_DIR / f"split_seed{seed}_cases_{case_names}.json"
 
 
 def summarize_split_counts_leadtime(y: np.ndarray, idx: np.ndarray, ids_split: np.ndarray, point_is_core: Dict[str, int], name: str) -> None:
@@ -1457,6 +1531,24 @@ def select_row_indices(ids: np.ndarray, allowed_ids: np.ndarray) -> np.ndarray:
     return np.where(mask)[0]
 
 
+def aggregate_case_metrics(case_summaries: List[dict]) -> dict:
+    def _mean(key: str) -> float:
+        vals = [cs.get(key, np.nan) for cs in case_summaries]
+        vals = [v for v in vals if isinstance(v, (int, float)) and not np.isnan(v)]
+        if not vals:
+            return float("nan")
+        return float(np.mean(vals))
+
+    return {
+        "lead_time_days": _mean("lead_time_days"),
+        "far": _mean("far"),
+        "tpr": _mean("tpr"),
+        "core_mean_risk_p": _mean("core_mean_risk_p"),
+        "auc_core_vs_near_p": _mean("auc_core_vs_near_p"),
+        "auc_near_lastN_mean": _mean("auc_near_lastN_mean"),
+    }
+
+
 def run_experiment(cfg: dict, run_dir: Path, split_path: Path | None = None) -> dict:
     ensure_run_dirs(run_dir)
 
@@ -1465,53 +1557,72 @@ def run_experiment(cfg: dict, run_dir: Path, split_path: Path | None = None) -> 
 
     task = str(cfg.get("TASK", "leadtime_cls")).lower()
 
-    data_cfg = cfg["DATA"]
     label_cfg = cfg["LABELING"]
-
-    df = load_points_csv(str(data_cfg["CSV_PATH"]))
-    epoch_cols, epoch_dates = detect_and_sort_epochs(df)
-
-    last_obs_idx = get_index_for_date(epoch_dates, str(data_cfg["LAST_OBS_DATE"]))
-    if last_obs_idx != len(epoch_cols) - 1:
-        print(
-            "Warning: last observation date is not the final epoch column. "
-            f"Using index {last_obs_idx} ({epoch_cols[last_obs_idx]})."
-        )
-    t_last = last_obs_idx
-
-    polygon = load_polygon_kml(str(data_cfg["KML_PATH"]))
-    epsg_utm = compute_utm_epsg(polygon)
-
-    df_latlon, df_utm, polygon_utm, _ = label_points(
-        df=df,
-        polygon=polygon,
-        epsg_utm=epsg_utm,
-        buffer_m=float(label_cfg["BUFFER_M"]),
-        near_min_m=float(label_cfg["NEAR_MIN_M"]),
-        near_max_m=float(label_cfg["NEAR_MAX_M"]),
-        far_min_m=float(label_cfg["FAR_MIN_M"]),
-    )
-
-    values = df_latlon[epoch_cols].to_numpy(dtype=np.float32)
-    ids = df_latlon["ID"].astype(str).to_numpy()
-    label_texts = df_latlon["label_text"].astype(str).to_numpy()
-
     input_mode = str(label_cfg["INPUT_MODE"]).lower()
     neg_mode = str(label_cfg["NEG_MODE"]).lower()
     window_length = int(label_cfg["WINDOW_LENGTH"])
     horizon_h = int(label_cfg["HORIZON_H"])
 
+    cases_cfg = normalize_cases(cfg)
+
+    # Prepare cases.
+    cases: list[dict] = []
+    all_point_ids: list[str] = []
+    point_is_core: dict[str, int] = {}
+
+    for case in cases_cfg:
+        case_name = case.get("name", "case")
+        df = load_points_csv(str(case["csv_path"]))
+        epoch_cols, epoch_dates = detect_and_sort_epochs(df)
+
+        last_obs_date = case.get("last_obs_date")
+        if not last_obs_date:
+            last_obs_date = str(epoch_dates[-1].date())
+        t_last = get_index_for_date(epoch_dates, str(last_obs_date))
+
+        polygon = load_polygon_kml(str(case["kml_path"]))
+        epsg_utm = compute_utm_epsg(polygon)
+
+        df_latlon, df_utm, polygon_utm, _ = label_points(
+            df=df,
+            polygon=polygon,
+            epsg_utm=epsg_utm,
+            buffer_m=float(label_cfg["BUFFER_M"]),
+            near_min_m=float(label_cfg["NEAR_MIN_M"]),
+            near_max_m=float(label_cfg["NEAR_MAX_M"]),
+            far_min_m=float(label_cfg["FAR_MIN_M"]),
+        )
+
+        ids = df_latlon["ID"].astype(str).apply(lambda x: f"{case_name}:{x}").to_numpy()
+        label_texts = df_latlon["label_text"].astype(str).to_numpy()
+        values = df_latlon[epoch_cols].to_numpy(dtype=np.float32)
+
+        case_dict = {
+            "name": case_name,
+            "event_date": case.get("event_date"),
+            "last_obs_date": str(last_obs_date),
+            "df_latlon": df_latlon,
+            "df_utm": df_utm,
+            "polygon": polygon,
+            "polygon_utm": polygon_utm,
+            "epoch_cols": epoch_cols,
+            "epoch_dates": epoch_dates,
+            "t_last": t_last,
+            "ids": ids,
+            "label_texts": label_texts,
+            "values": values,
+        }
+        cases.append(case_dict)
+
+        for pid, lbl in zip(ids, label_texts):
+            if lbl in {"core", "near-field", "far-field"}:
+                all_point_ids.append(str(pid))
+                point_is_core[str(pid)] = int(lbl == "core")
+
     # Shared split file across all tasks/runs.
     if split_path is None:
         split_path = default_split_path_for_cfg(cfg)
 
-    all_point_ids = (
-        df_latlon.loc[df_latlon["label_text"].isin(["core", "near-field", "far-field"]), "ID"].astype(str).tolist()
-    )
-    point_is_core: dict[str, int] = {
-        str(pid): int(lbl == "core")
-        for pid, lbl in zip(df_latlon["ID"].astype(str), df_latlon["label_text"].astype(str))
-    }
     train_ids, val_ids, test_ids = resolve_shared_split(split_path, all_point_ids, point_is_core, cfg["SPLIT"])
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1521,20 +1632,15 @@ def run_experiment(cfg: dict, run_dir: Path, split_path: Path | None = None) -> 
     else:
         print(f"Using device: {device}")
 
-    # Task-specific training/inference to produce risk_cube and k_indices.
     batch_size_train = int(cfg["TRAINING"]["BATCH_SIZE"])
     batch_size_infer = int(cfg["INFERENCE"]["BATCH_SIZE"])
 
     test_auc_proxy = float("nan")
+    case_summaries: list[dict] = []
 
     if task == "leadtime_cls":
-        X, y, point_to_indices, _ = build_training_windows_leadtime(
-            values=values,
-            ids=ids,
-            label_texts=label_texts,
-            epoch_cols=epoch_cols,
-            epoch_dates=epoch_dates,
-            t_last=t_last,
+        X_all, y_all, point_to_indices = build_training_windows_leadtime_multi(
+            cases=cases,
             window_length=window_length,
             horizon_h=horizon_h,
             input_mode=input_mode,
@@ -1546,17 +1652,17 @@ def run_experiment(cfg: dict, run_dir: Path, split_path: Path | None = None) -> 
         test_idx = indices_for_points(test_ids, point_to_indices)
 
         print("Point split counts (grouped by point ID):")
-        summarize_split_counts_leadtime(y, train_idx, train_ids, point_is_core, "Train")
-        summarize_split_counts_leadtime(y, val_idx, val_ids, point_is_core, "Val")
-        summarize_split_counts_leadtime(y, test_idx, test_ids, point_is_core, "Test")
+        summarize_split_counts_leadtime(y_all, train_idx, train_ids, point_is_core, "Train")
+        summarize_split_counts_leadtime(y_all, val_idx, val_ids, point_is_core, "Val")
+        summarize_split_counts_leadtime(y_all, test_idx, test_ids, point_is_core, "Test")
 
         if len(train_idx) == 0 or len(val_idx) == 0 or len(test_idx) == 0:
             raise ValueError("One of the splits has zero samples. Check neg_mode and labeling.")
 
-        in_ch = X.shape[1]
-        train_loader = DataLoader(WindowDataset(X[train_idx], y[train_idx]), batch_size=batch_size_train, shuffle=True)
-        val_loader = DataLoader(WindowDataset(X[val_idx], y[val_idx]), batch_size=batch_size_train, shuffle=False)
-        test_loader = DataLoader(WindowDataset(X[test_idx], y[test_idx]), batch_size=batch_size_train, shuffle=False)
+        in_ch = X_all.shape[1]
+        train_loader = DataLoader(WindowDataset(X_all[train_idx], y_all[train_idx]), batch_size=batch_size_train, shuffle=True)
+        val_loader = DataLoader(WindowDataset(X_all[val_idx], y_all[val_idx]), batch_size=batch_size_train, shuffle=False)
+        test_loader = DataLoader(WindowDataset(X_all[test_idx], y_all[test_idx]), batch_size=batch_size_train, shuffle=False)
 
         model = build_model(cfg, in_ch=in_ch).to(device)
         best_path = train_model_binary(model, train_loader, val_loader, device=device, cfg=cfg, run_dir=run_dir)
@@ -1564,61 +1670,118 @@ def run_experiment(cfg: dict, run_dir: Path, split_path: Path | None = None) -> 
         print(f"Test AUC (group split, time-aware labels): {test_auc_proxy:.4f}")
         print(f"Best model saved to: {best_path}")
 
-        start_k = window_length - 1
-        end_k = min(t_last, len(epoch_cols) - 1)
-        k_indices = list(range(start_k, end_k + 1))
-        risk_cube = compute_risk_cube_leadtime(
-            model,
-            values=values,
-            k_indices=k_indices,
-            window_length=window_length,
-            input_mode=input_mode,
-            device=device,
-            batch_size=batch_size_infer,
-        )
+        for case in cases:
+            start_k = window_length - 1
+            end_k = min(case["t_last"], len(case["epoch_cols"]) - 1)
+            k_indices = list(range(start_k, end_k + 1))
+
+            risk_cube = compute_risk_cube_leadtime(
+                model,
+                values=case["values"],
+                k_indices=k_indices,
+                window_length=window_length,
+                input_mode=input_mode,
+                device=device,
+                batch_size=batch_size_infer,
+            )
+
+            case_dir = run_dir / case["name"]
+            ensure_run_dirs(case_dir)
+            mean_df, auc_df, _, lead_and_trend = evaluate_and_save_outputs(
+                risk_cube=risk_cube,
+                k_indices=k_indices,
+                df_latlon=case["df_latlon"],
+                df_utm=case["df_utm"],
+                polygon_latlon=case["polygon"],
+                polygon_utm=case["polygon_utm"],
+                epoch_cols=case["epoch_cols"],
+                epoch_dates=case["epoch_dates"],
+                t_last=case["t_last"],
+                event_date=case["event_date"],
+                cfg=cfg,
+                run_dir=case_dir,
+            )
+
+            write_results_readme(
+                cfg,
+                t_last=case["t_last"],
+                epoch_cols=case["epoch_cols"],
+                epoch_dates=case["epoch_dates"],
+                run_dir=case_dir,
+                event_date=case["event_date"],
+                last_obs=case["last_obs_date"],
+            )
+
+            last_n = int(cfg["STATS"].get("LAST_N", horizon_h))
+            auc_tail = auc_df.tail(last_n)["auc"].to_numpy(dtype=float)
+            auc_tail_mean = float(np.nanmean(auc_tail)) if len(auc_tail) else float("nan")
+
+            case_summaries.append(
+                {
+                    "lead_time_days": lead_and_trend.get("lead_time_days", float("nan")),
+                    "far": lead_and_trend.get("far_actual", float("nan")),
+                    "tpr": lead_and_trend.get("tpr_near_event", float("nan")),
+                    "core_mean_risk_p": lead_and_trend.get("core_mean_risk_p"),
+                    "auc_core_vs_near_p": lead_and_trend.get("auc_core_vs_near_p"),
+                    "auc_near_lastN_mean": auc_tail_mean,
+                }
+            )
 
     elif task == "survival_discrete":
-        start_k = window_length - 1
-        end_k = min(t_last, len(epoch_cols) - 1)
-        k_indices = list(range(start_k, end_k + 1))
+        seqs: list[np.ndarray] = []
+        event_flags: list[np.ndarray] = []
+        t_event_idxs: list[np.ndarray] = []
+        ids_allowed_all: list[np.ndarray] = []
 
-        X_seq_all = precompute_seq_windows(values, k_indices, window_length=window_length, input_mode=input_mode)
+        for case in cases:
+            start_k = window_length - 1
+            end_k = min(case["t_last"], len(case["epoch_cols"]) - 1)
+            k_indices = list(range(start_k, end_k + 1))
 
-        # Event at t_last for core points; censored for others.
-        event_flag_all = (label_texts == "core").astype(np.float32)
+            X_seq_all = precompute_seq_windows(case["values"], k_indices, window_length=window_length, input_mode=input_mode)
+            event_flag_all = (case["label_texts"] == "core").astype(np.float32)
 
-        # Neg mode controls which non-core points contribute to training.
-        if neg_mode == "near_only":
-            allowed_mask = np.isin(label_texts, ["core", "near-field"])
-        else:
-            allowed_mask = np.isin(label_texts, ["core", "near-field", "far-field"])
+            if neg_mode == "near_only":
+                allowed_mask = np.isin(case["label_texts"], ["core", "near-field"])
+            else:
+                allowed_mask = np.isin(case["label_texts"], ["core", "near-field", "far-field"])
 
-        ids_allowed = ids[allowed_mask]
-        X_seq_allowed = X_seq_all[allowed_mask]
-        event_allowed = event_flag_all[allowed_mask]
+            ids_allowed = case["ids"][allowed_mask]
+            X_seq_allowed = X_seq_all[allowed_mask]
+            event_allowed = event_flag_all[allowed_mask]
+            t_event = np.full(len(ids_allowed), len(k_indices) - 1, dtype=np.int64)
 
-        id_to_row = {pid: i for i, pid in enumerate(ids_allowed.tolist())}
+            seqs.append(X_seq_allowed)
+            event_flags.append(event_allowed)
+            t_event_idxs.append(t_event)
+            ids_allowed_all.append(ids_allowed)
 
+        X_pad, mask_pad = pad_sequences(seqs)
+        event_all = np.concatenate(event_flags, axis=0)
+        t_event_all = np.concatenate(t_event_idxs, axis=0)
+        ids_allowed_all_flat = np.concatenate(ids_allowed_all, axis=0)
+
+        id_to_row = {pid: i for i, pid in enumerate(ids_allowed_all_flat.tolist())}
         train_rows = np.array([id_to_row[pid] for pid in train_ids if pid in id_to_row], dtype=np.int64)
         val_rows = np.array([id_to_row[pid] for pid in val_ids if pid in id_to_row], dtype=np.int64)
         test_rows = np.array([id_to_row[pid] for pid in test_ids if pid in id_to_row], dtype=np.int64)
 
         print("Point split counts (grouped by point ID):")
-        summarize_split_counts_survival(event_allowed, train_ids, id_to_row, "Train")
-        summarize_split_counts_survival(event_allowed, val_ids, id_to_row, "Val")
-        summarize_split_counts_survival(event_allowed, test_ids, id_to_row, "Test")
+        summarize_split_counts_survival(event_all, train_ids, id_to_row, "Train")
+        summarize_split_counts_survival(event_all, val_ids, id_to_row, "Val")
+        summarize_split_counts_survival(event_all, test_ids, id_to_row, "Test")
 
         if len(train_rows) == 0 or len(val_rows) == 0 or len(test_rows) == 0:
             raise ValueError("One of the survival splits has zero points after filtering.")
 
-        in_ch = X_seq_allowed.shape[2]
+        in_ch = X_pad.shape[2]
         train_loader = DataLoader(
-            SurvivalPointDataset(X_seq_allowed[train_rows], event_allowed[train_rows], ids_allowed[train_rows]),
+            SurvivalPointDataset(X_pad[train_rows], mask_pad[train_rows], event_all[train_rows], t_event_all[train_rows]),
             batch_size=batch_size_train,
             shuffle=True,
         )
         val_loader = DataLoader(
-            SurvivalPointDataset(X_seq_allowed[val_rows], event_allowed[val_rows], ids_allowed[val_rows]),
+            SurvivalPointDataset(X_pad[val_rows], mask_pad[val_rows], event_all[val_rows], t_event_all[val_rows]),
             batch_size=batch_size_train,
             shuffle=False,
         )
@@ -1627,45 +1790,122 @@ def run_experiment(cfg: dict, run_dir: Path, split_path: Path | None = None) -> 
         best_path = train_model_survival(model, train_loader, val_loader, device=device, cfg=cfg, run_dir=run_dir)
         print(f"Best model saved to: {best_path}")
 
-        # Risk for all points (including far-field) using cumulative hazard.
-        risk_cube = compute_risk_cube_survival(
-            model,
-            X_seq=X_seq_all,
-            device=device,
-            batch_size=batch_size_infer,
-        )
+        for case in cases:
+            start_k = window_length - 1
+            end_k = min(case["t_last"], len(case["epoch_cols"]) - 1)
+            k_indices = list(range(start_k, end_k + 1))
+
+            X_seq_case = precompute_seq_windows(case["values"], k_indices, window_length=window_length, input_mode=input_mode)
+
+            risk_cube = compute_risk_cube_survival(
+                model,
+                X_seq=X_seq_case,
+                device=device,
+                batch_size=batch_size_infer,
+            )
+
+            case_dir = run_dir / case["name"]
+            ensure_run_dirs(case_dir)
+            mean_df, auc_df, _, lead_and_trend = evaluate_and_save_outputs(
+                risk_cube=risk_cube,
+                k_indices=k_indices,
+                df_latlon=case["df_latlon"],
+                df_utm=case["df_utm"],
+                polygon_latlon=case["polygon"],
+                polygon_utm=case["polygon_utm"],
+                epoch_cols=case["epoch_cols"],
+                epoch_dates=case["epoch_dates"],
+                t_last=case["t_last"],
+                event_date=case["event_date"],
+                cfg=cfg,
+                run_dir=case_dir,
+            )
+
+            write_results_readme(
+                cfg,
+                t_last=case["t_last"],
+                epoch_cols=case["epoch_cols"],
+                epoch_dates=case["epoch_dates"],
+                run_dir=case_dir,
+                event_date=case["event_date"],
+                last_obs=case["last_obs_date"],
+            )
+
+            last_n = int(cfg["STATS"].get("LAST_N", horizon_h))
+            auc_tail = auc_df.tail(last_n)["auc"].to_numpy(dtype=float)
+            auc_tail_mean = float(np.nanmean(auc_tail)) if len(auc_tail) else float("nan")
+
+            case_summaries.append(
+                {
+                    "lead_time_days": lead_and_trend.get("lead_time_days", float("nan")),
+                    "far": lead_and_trend.get("far_actual", float("nan")),
+                    "tpr": lead_and_trend.get("tpr_near_event", float("nan")),
+                    "core_mean_risk_p": lead_and_trend.get("core_mean_risk_p"),
+                    "auc_core_vs_near_p": lead_and_trend.get("auc_core_vs_near_p"),
+                    "auc_near_lastN_mean": auc_tail_mean,
+                }
+            )
 
     elif task == "forecast_anom":
         forecast_cfg = cfg.get("FORECAST", {})
         horizon_f = int(forecast_cfg.get("HORIZON_F", 5))
         train_mode = str(forecast_cfg.get("TRAIN_MODE", "all")).lower()
 
-        # Forecast indices must allow at least one future observation.
-        start_k = window_length - 1
-        end_k_forecast = min(t_last - 1, len(epoch_cols) - 1)
-        k_indices_all = list(range(start_k, end_k_forecast + 1))
+        X_train_parts: list[np.ndarray] = []
+        y_train_parts: list[np.ndarray] = []
+        m_train_parts: list[np.ndarray] = []
+        X_val_parts: list[np.ndarray] = []
+        y_val_parts: list[np.ndarray] = []
+        m_val_parts: list[np.ndarray] = []
+        X_test_parts: list[np.ndarray] = []
+        y_test_parts: list[np.ndarray] = []
+        m_test_parts: list[np.ndarray] = []
 
-        # Optional strict training range.
-        if train_mode == "early":
-            calib_offset = int(cfg["THRESHOLDING"]["FAR_CALIB_END_OFFSET_FROM_LAST"])
-            calib_end_k = max(start_k, t_last - calib_offset)
-            k_indices_train = [k for k in k_indices_all if k <= calib_end_k]
-        else:
-            k_indices_train = k_indices_all
+        for case in cases:
+            start_k = window_length - 1
+            end_k = min(case["t_last"] - 1, len(case["epoch_cols"]) - 1)
+            k_indices_all = list(range(start_k, end_k + 1))
 
-        train_rows = select_row_indices(ids, train_ids)
-        val_rows = select_row_indices(ids, val_ids)
-        test_rows = select_row_indices(ids, test_ids)
+            if train_mode == "early":
+                calib_offset = int(cfg["THRESHOLDING"]["FAR_CALIB_END_OFFSET_FROM_LAST"])
+                calib_end_k = max(start_k, case["t_last"] - calib_offset)
+                k_indices_train = [k for k in k_indices_all if k <= calib_end_k]
+            else:
+                k_indices_train = k_indices_all
 
-        X_train, y_train, m_train = build_forecast_samples(
-            values, train_rows, k_indices_train, window_length, horizon_f, input_mode
-        )
-        X_val, y_val, m_val = build_forecast_samples(
-            values, val_rows, k_indices_train, window_length, horizon_f, input_mode
-        )
-        X_test, y_test, m_test = build_forecast_samples(
-            values, test_rows, k_indices_train, window_length, horizon_f, input_mode
-        )
+            train_rows = select_row_indices(case["ids"], train_ids)
+            val_rows = select_row_indices(case["ids"], val_ids)
+            test_rows = select_row_indices(case["ids"], test_ids)
+
+            X_train, y_train, m_train = build_forecast_samples(
+                case["values"], train_rows, k_indices_train, window_length, horizon_f, input_mode
+            )
+            X_val, y_val, m_val = build_forecast_samples(
+                case["values"], val_rows, k_indices_train, window_length, horizon_f, input_mode
+            )
+            X_test, y_test, m_test = build_forecast_samples(
+                case["values"], test_rows, k_indices_train, window_length, horizon_f, input_mode
+            )
+
+            X_train_parts.append(X_train)
+            y_train_parts.append(y_train)
+            m_train_parts.append(m_train)
+            X_val_parts.append(X_val)
+            y_val_parts.append(y_val)
+            m_val_parts.append(m_val)
+            X_test_parts.append(X_test)
+            y_test_parts.append(y_test)
+            m_test_parts.append(m_test)
+
+        X_train = np.concatenate(X_train_parts, axis=0)
+        y_train = np.concatenate(y_train_parts, axis=0)
+        m_train = np.concatenate(m_train_parts, axis=0)
+        X_val = np.concatenate(X_val_parts, axis=0)
+        y_val = np.concatenate(y_val_parts, axis=0)
+        m_val = np.concatenate(m_val_parts, axis=0)
+        X_test = np.concatenate(X_test_parts, axis=0)
+        y_test = np.concatenate(y_test_parts, axis=0)
+        m_test = np.concatenate(m_test_parts, axis=0)
 
         summarize_split_counts_forecast(len(X_train), len(X_val), len(X_test))
 
@@ -1677,56 +1917,77 @@ def run_experiment(cfg: dict, run_dir: Path, split_path: Path | None = None) -> 
         best_path = train_model_forecast(model, train_loader, val_loader, device=device, cfg=cfg, run_dir=run_dir)
         print(f"Best model saved to: {best_path}")
 
-        # Inference indices use all epochs with a future horizon.
-        k_indices = k_indices_all
-        anom_cube = compute_anomaly_cube_forecast(
-            model,
-            values=values,
-            k_indices=k_indices,
-            window_length=window_length,
-            horizon_f=horizon_f,
-            input_mode=input_mode,
-            device=device,
-            batch_size=batch_size_infer,
-        )
+        for case in cases:
+            start_k = window_length - 1
+            end_k_forecast = min(case["t_last"] - 1, len(case["epoch_cols"]) - 1)
+            k_indices = list(range(start_k, end_k_forecast + 1))
 
-        # Calibrate anomaly -> risk using near-field early epochs.
-        near_idx = np.where(label_texts == "near-field")[0]
-        calib_offset = int(cfg["THRESHOLDING"]["FAR_CALIB_END_OFFSET_FROM_LAST"])
-        calib_end_k = max(start_k, t_last - calib_offset)
-        risk_cube, _ = calibrate_anomaly_to_risk(anom_cube, k_indices, near_idx=near_idx, calib_end_k=calib_end_k)
+            anom_cube = compute_anomaly_cube_forecast(
+                model,
+                values=case["values"],
+                k_indices=k_indices,
+                window_length=window_length,
+                horizon_f=horizon_f,
+                input_mode=input_mode,
+                device=device,
+                batch_size=batch_size_infer,
+            )
+
+            near_idx = np.where(case["label_texts"] == "near-field")[0]
+            calib_offset = int(cfg["THRESHOLDING"]["FAR_CALIB_END_OFFSET_FROM_LAST"])
+            calib_end_k = max(start_k, case["t_last"] - calib_offset)
+            risk_cube, _ = calibrate_anomaly_to_risk(anom_cube, k_indices, near_idx=near_idx, calib_end_k=calib_end_k)
+
+            case_dir = run_dir / case["name"]
+            ensure_run_dirs(case_dir)
+            mean_df, auc_df, _, lead_and_trend = evaluate_and_save_outputs(
+                risk_cube=risk_cube,
+                k_indices=k_indices,
+                df_latlon=case["df_latlon"],
+                df_utm=case["df_utm"],
+                polygon_latlon=case["polygon"],
+                polygon_utm=case["polygon_utm"],
+                epoch_cols=case["epoch_cols"],
+                epoch_dates=case["epoch_dates"],
+                t_last=case["t_last"],
+                event_date=case["event_date"],
+                cfg=cfg,
+                run_dir=case_dir,
+            )
+
+            write_results_readme(
+                cfg,
+                t_last=case["t_last"],
+                epoch_cols=case["epoch_cols"],
+                epoch_dates=case["epoch_dates"],
+                run_dir=case_dir,
+                event_date=case["event_date"],
+                last_obs=case["last_obs_date"],
+            )
+
+            last_n = int(cfg["STATS"].get("LAST_N", horizon_h))
+            auc_tail = auc_df.tail(last_n)["auc"].to_numpy(dtype=float)
+            auc_tail_mean = float(np.nanmean(auc_tail)) if len(auc_tail) else float("nan")
+
+            case_summaries.append(
+                {
+                    "lead_time_days": lead_and_trend.get("lead_time_days", float("nan")),
+                    "far": lead_and_trend.get("far_actual", float("nan")),
+                    "tpr": lead_and_trend.get("tpr_near_event", float("nan")),
+                    "core_mean_risk_p": lead_and_trend.get("core_mean_risk_p"),
+                    "auc_core_vs_near_p": lead_and_trend.get("auc_core_vs_near_p"),
+                    "auc_near_lastN_mean": auc_tail_mean,
+                }
+            )
 
     else:
         raise ValueError(f"Unknown TASK: {task}")
 
-    mean_df, auc_df, auc_far_df, lead_and_trend = evaluate_and_save_outputs(
-        risk_cube=risk_cube,
-        k_indices=k_indices,
-        values=values,
-        df_latlon=df_latlon,
-        df_utm=df_utm,
-        polygon_latlon=polygon,
-        polygon_utm=polygon_utm,
-        epoch_cols=epoch_cols,
-        epoch_dates=epoch_dates,
-        t_last=t_last,
-        cfg=cfg,
-        run_dir=run_dir,
-    )
+    agg = aggregate_case_metrics(case_summaries)
 
-    write_results_readme(cfg, t_last=t_last, epoch_cols=epoch_cols, epoch_dates=epoch_dates, run_dir=run_dir)
-
-    near_rng = list(near_event_range(t_last, horizon_h))
-    near_epochs = [epoch_cols[k] for k in near_rng]
-    print(
-        "Near-event window epochs: "
-        f"{near_epochs[0]} .. {near_epochs[-1]} (H={label_cfg['HORIZON_H']})"
-    )
-    print(f"Saved outputs under: {run_dir}")
-
-    last_n = int(cfg["STATS"].get("LAST_N", horizon_h))
-    auc_tail = auc_df.tail(last_n)["auc"].to_numpy(dtype=float)
-    auc_tail_mean = float(np.nanmean(auc_tail)) if len(auc_tail) else float("nan")
+    print("Saved outputs under:")
+    for case in cases:
+        print(f"- {run_dir / case['name']}")
 
     summary = {
         "run_dir": str(run_dir),
@@ -1737,14 +1998,14 @@ def run_experiment(cfg: dict, run_dir: Path, split_path: Path | None = None) -> 
         "H": horizon_h,
         "Hf": int(cfg.get("FORECAST", {}).get("HORIZON_F", 0)),
         "test_auc": test_auc_proxy,
-        "auc_near_lastN_mean": auc_tail_mean,
-        "lead_time_days": float(lead_and_trend.get("lead_time_days", float("nan"))),
-        "far": float(lead_and_trend.get("far_actual", float("nan"))),
-        "tpr": float(lead_and_trend.get("tpr_near_event", float("nan"))),
+        "auc_near_lastN_mean": agg.get("auc_near_lastN_mean"),
+        "lead_time_days": agg.get("lead_time_days"),
+        "far": agg.get("far"),
+        "tpr": agg.get("tpr"),
         "trend_pvalues": json.dumps(
             {
-                "core_mean_risk_p": lead_and_trend.get("core_mean_risk_p"),
-                "auc_core_vs_near_p": lead_and_trend.get("auc_core_vs_near_p"),
+                "core_mean_risk_p": agg.get("core_mean_risk_p"),
+                "auc_core_vs_near_p": agg.get("auc_core_vs_near_p"),
             }
         ),
         "split_path": str(split_path),

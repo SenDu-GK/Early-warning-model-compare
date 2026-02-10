@@ -2,10 +2,17 @@
 TASK: leadtime_cls
 
 DATA:
-  CSV_PATH: Cadia_PSI.csv
-  KML_PATH: landslide area.kml
-  EVENT_DATE: 2018-03-09
-  LAST_OBS_DATE: 2018-02-25
+  CASES:
+    - name: cadia
+      csv_path: Cadia_PSI.csv
+      kml_path: cadia_failure.kml
+      event_date: 2018-03-09
+      last_obs_date: 2018-02-25
+    - name: chambishi
+      csv_path: chambishi/Output_geocoded_lines_Chambishi_Des_gamma0.7_DA0.45.csv
+      kml_path: chambishi_failure.kml
+      event_date: 2025-02-18
+      last_obs_date: 2025-02-18
 
 LABELING:
   WINDOW_LENGTH: 12
