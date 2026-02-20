@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2" xmlns:kml="http://www.opengis.net/kml/2.2" xmlns:atom="http://www.w3.org/2005/Atom">
+<Document>
+	<name>ministro_failure.kml</name>
+	<StyleMap id="m_ylw-pushpin">
+		<Pair>
+			<key>normal</key>
+			<styleUrl>#s_ylw-pushpin</styleUrl>
+		</Pair>
+		<Pair>
+			<key>highlight</key>
+			<styleUrl>#s_ylw-pushpin_hl</styleUrl>
+		</Pair>
+	</StyleMap>
+	<Style id="s_ylw-pushpin">
+		<IconStyle>
+			<scale>1.1</scale>
+			<Icon>
+				<href>http://maps.google.com/mapfiles/kml/pushpin/ylw-pushpin.png</href>
+			</Icon>
+			<hotSpot x="20" y="2" xunits="pixels" yunits="pixels"/>
+		</IconStyle>
+		<LineStyle>
+			<color>ff0000ff</color>
+			<width>2.8</width>
+		</LineStyle>
+		<PolyStyle>
+			<fill>0</fill>
+		</PolyStyle>
+	</Style>
+	<Style id="s_ylw-pushpin_hl">
+		<IconStyle>
+			<scale>1.3</scale>
+			<Icon>
+				<href>http://maps.google.com/mapfiles/kml/pushpin/ylw-pushpin.png</href>
+			</Icon>
+			<hotSpot x="20" y="2" xunits="pixels" yunits="pixels"/>
+		</IconStyle>
+		<LineStyle>
+			<color>ff0000ff</color>
+			<width>2.8</width>
+		</LineStyle>
+		<PolyStyle>
+			<fill>0</fill>
+		</PolyStyle>
+	</Style>
+	<Placemark>
+		<name>ministro_failure</name>
+		<styleUrl>#m_ylw-pushpin</styleUrl>
+		<Polygon>
+			<tessellate>1</tessellate>
+			<outerBoundaryIs>
+				<LinearRing>
+					<coordinates>
+						-68.91410828004943,-22.38305560254494,0 -68.91527820811574,-22.38397561063703,0 -68.91537158202013,-22.38463350699689,0 -68.91516724614881,-22.38514941147688,0 -68.91363583349514,-22.38530073191612,0 -68.91196981485642,-22.38531940062405,0 -68.90924228524841,-22.38526206208103,0 -68.90790782072195,-22.3850507988641,0 -68.9078723149229,-22.38505048060624,0 -68.90677998210919,-22.38482353166153,0 -68.90664609001718,-22.38380621784705,0 -68.90653114139411,-22.38323725939112,0 -68.90691600983033,-22.38184291132902,0 -68.9069299678532,-22.38173553683527,0 -68.90694692182646,-22.38169984571339,0 -68.90710452958206,-22.3809975260809,0 -68.90710056424959,-22.38088851473573,0 -68.9074399172586,-22.38045545285384,0 -68.90790318302469,-22.38029891487359,0 -68.90792231418148,-22.38031737980862,0 -68.90875366058047,-22.38094142630402,0 -68.90937060129183,-22.38134415870916,0 -68.91106919036969,-22.38159765881258,0 -68.91203558924752,-22.38222875140464,0 -68.91311751062266,-22.38281851807072,0 -68.91410828004943,-22.38305560254494,0 
+					</coordinates>
+				</LinearRing>
+			</outerBoundaryIs>
+		</Polygon>
+		<atom:link rel="app" href="https://www.google.com/earth/about/versions/#earth-pro" title="Google Earth Pro 7.3.6.10441"></atom:link>
+	</Placemark>
+</Document>
+</kml>

@@ -6,3 +6,16 @@
 
 
 下载数据
+帮我写一个python代码用来下载哨兵数据，我已经有了ministro_insar_processing/asc/data/download-all-ASC_ministro_chili.py，但是问题是有时候会断，帮我写一个可以同时读取这个ministro_insar_processing/asc/data/download-all-ASC_ministro_chili.py和/home/dusen/Geokinesia/Early-warning-model-compare/ministro_insar_processing/des/data/download-all-DSC_ministro_chili.py文件的，然后每半个小时检查一下是否还在继续，不下了就重新开始，然后我的ASF账号密码：账号SenDu密码Dusen130730199206031838写好的程序放到/home/dusen/Geokinesia/Early-warning-model-compare/tools这里
+
+处理ministro数据
+
+帮我使用iscemintpy环境处理一下哨兵数据，work dir在/home/dusen/Geokinesia/Early-warning-model-compare/ministro_insar_processing这里，升轨降轨分别在asc和des文件夹里，Sentinel-1数据都在对应的data文件夹里，帮我把对应的isce处理放到isce文件夹里，mintpy处理结果放到mintpy文件夹里。不用大气校正，muitilook设置4 × 1，空间相干性先设置成0.4看看效果，不用时间相干性。ROI范围bbox （minLon, minLat, maxLon, maxLat）：(-68.944446, -22.408019, -68.885232, -22.354491)。isce的干涉图设置成相邻两个SLC做，也就是-c 设置为2。主影像你挑一个吧。所有影像都用上，精确轨道数据放到/home/dusen/Geokinesia/Early-warning-model-compare/ministro_insar_processing/orbits这里.DEM在这里：/home/dusen/Geokinesia/Early-warning-model-compare/ministro_insar_processing/DEM先做降轨，有需要的问我
+
+看看准备工作都做好没， 数据都下对了没。然后帮我处理一下isce和mintpy，先做降轨试试，空间相干性先设置成0.4看看效果，不用时间相干性。ROI范围bbox （minLon, minLat, maxLon, maxLat）：(-68.944446, -22.408019, -68.885232, -22.354491)升轨降轨分别在asc和des文件夹里，Sentinel-1数据都在对应的data文件夹里，帮我把对应的isce处理放到isce文件夹里，mintpy处理结果放到mintpy文件夹里。你可能会遇到范围过小导致影像裁剪出问题，如果出问题了，可以适当扩大，mintpy处理结果放到mintpy文件夹里。不用大气校正。有问题随时问我。
+ 
+你看看降轨的run16是不是跑完了，一切正常不，正常的话用smallbaselineApp.py -g生成一个参数文件，按照升轨mintpy同样的参数帮我配置一下， 内存上限可以从8改到32，numWorker可以改成4。然后我自己跑
+
+
+输出结果：
+升轨的时序结果，你帮我整理成/home/dusen/Geokinesia/Early-warning-model-compare/Cadia_PSI.csv这种格式，ID就是点号，不重要，你可以随便设置一个，Fi应该是纬度,Lambda经度,E,N,H是UTM坐标系和高程，Velocity_m,Sigma_ts_m,aceler,def0,都设为0就行，什么意思我也不知道。然后就是时序形变了，单位应该是毫米。日期是DYYYYMMDD，输出到Cadia_PSI.csv同一个文件夹，名字叫ministro_asc_PSI.csv，输出的结果范围纬度-22.411962°到-22.356613° 经度-68.939775°  到 -68.884389°，不用全图都输出。尽量不抽样。
